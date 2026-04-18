@@ -108,3 +108,59 @@ type Meta struct {
 	TipoMetaRealizado   string   `db:"tipo_meta_realizado"`
 	Observacao          *string  `db:"observacao"`
 }
+
+// DTO para receber KPI via JSON
+type CreateKPIRequest struct {
+	Nome             string        `json:"nome" validate:"required"`
+	Descricao        *string       `json:"descricao"`
+	IndicadorID      uint          `json:"indicador_id" validate:"required"`
+	TipoMeta         string        `json:"tipo_meta" validate:"required"`
+	Periodicidade    string        `json:"periodicidade" validate:"required"`
+	FormulaCalculo   *string       `json:"formula_calculo"`
+	UnidadeMedidaKPI *string       `json:"unidade_medida_kpi"`
+	Metas            []MetaRequest `json:"metas"`
+}
+
+type MetaRequest struct {
+	Ano                 uint     `json:"ano" validate:"required"`
+	PeriodoReferencia   string   `json:"periodo_referencia"`
+	ValorMetaNumerica   *float64 `json:"valor_meta_numerica"`
+	ValorMetaPercentual *float64 `json:"valor_meta_percentual"`
+	ValorMetaMin        *float64 `json:"valor_meta_min"`
+	ValorMetaMax        *float64 `json:"valor_meta_max"`
+	TipoMetaRealizado   string   `json:"tipo_meta_realizado" validate:"required"`
+	Observacao          *string  `json:"observacao"`
+}
+
+// DTO para resposta da API
+type KPIResponse struct {
+	ID            uint           `json:"id"`
+	Nome          string         `json:"nome"`
+	Descricao     *string        `json:"descricao"`
+	IndicadorID   uint           `json:"indicador_id"`
+	TipoMeta      string         `json:"tipo_meta"`
+	Periodicidade string         `json:"periodicidade"`
+	CreatedAt     time.Time      `json:"created_at"`
+	Metas         []MetaResponse `json:"metas,omitempty"`
+}
+
+type MetaResponse struct {
+	ID                  uint     `json:"id"`
+	Ano                 uint     `json:"ano"`
+	PeriodoReferencia   *string  `json:"periodo_referencia"`
+	ValorMetaNumerica   *float64 `json:"valor_meta_numerica,omitempty"`
+	ValorMetaPercentual *float64 `json:"valor_meta_percentual,omitempty"`
+	ValorMetaMin        *float64 `json:"valor_meta_min,omitempty"`
+	ValorMetaMax        *float64 `json:"valor_meta_max,omitempty"`
+	TipoMetaRealizado   string   `json:"tipo_meta_realizado"`
+	Observacao          *string  `json:"observacao"`
+}
+
+// DTO para resposta completa (incluindo requisitos gerados)
+type CompleteKPIResponse struct {
+	KPI        *KPIResponse           `json:"kpi"`
+	Requisitos *GeneratedRequirements `json:"requisitos_gerados,omitempty"`
+	Metas      []MetaResponse         `json:"metas"`
+	Success    bool                   `json:"success"`
+	Message    string                 `json:"message,omitempty"`
+}
