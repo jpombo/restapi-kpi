@@ -2,8 +2,11 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"kpi-requirement-generator/models"
 	"kpi-requirement-generator/service"
@@ -32,34 +35,21 @@ func (h *KPIHandler) CreateKPIWithMetas(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Validar campos obrigatórios
-	if req.Nome == "" {
-		respondWithError(w, http.StatusBadRequest, "Campo 'nome' é obrigatório")
-		return
-	}
-
-	if req.IndicadorID == 0 {
-		respondWithError(w, http.StatusBadRequest, "Campo 'indicador_id' é obrigatório")
-		return
-	}
-
-	if req.TipoMeta == "" {
-		respondWithError(w, http.StatusBadRequest, "Campo 'tipo_meta' é obrigatório")
-		return
-	}
-
-	if req.Periodicidade == "" {
-		respondWithError(w, http.StatusBadRequest, "Campo 'periodicidade' é obrigatório")
+	if err := validateRequest(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	// Processar KPI (insere no banco e chama Ollama)
 	result, err := h.kpiService.CreateKPIWithMetasAndGenerateRequirements(&req)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Erro ao processar KPI: "+err.Error())
+		// Em caso de erro nos inserts, retorna HTTP 304 (Not Modified)
+		respondWithError(w, http.StatusNotModified, "Falha ao inserir dados: "+err.Error())
 		return
 	}
 
-	respondWithJSON(w, http.StatusCreated, result)
+	// Sucesso nos inserts - retorna HTTP 200 com os dados
+	respondWithJSON(w, http.StatusOK, result)
 }
 
 // GetKPI handler para buscar um KPI por ID
@@ -101,7 +91,7 @@ func (h *KPIHandler) GenerateRequirementsForKPI(w http.ResponseWriter, r *http.R
 
 	requirements, err := h.kpiService.GenerateRequirementsForExistingKPI(uint(id))
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Erro ao gerar requisitos: "+err.Error())
+		respondWithError(w, http.StatusNotModified, "Erro ao gerar requisitos: "+err.Error())
 		return
 	}
 
@@ -136,17 +126,41 @@ func (h *KPIHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// validateRequest valida os campos obrigatórios
+func validateRequest(req *models.CreateKPIRequest) error {
+	if req.Nome == "" {
+		return fmt.Errorf("campo 'nome' é obrigatório")
+	}
+
+	if req.IndicadorID == 0 {
+		return fmt.Errorf("campo 'indicador_id' é obrigatório")
+	}
+
+	if req.TipoMeta == "" {
+		return fmt.Errorf("campo 'tipo_meta' é obrigatório")
+	}
+
+	if req.Periodicidade == "" {
+		return fmt.Errorf("campo 'periodicidade' é obrigatório")
+	}
+
+	return nil
+}
+
 // Funções auxiliares
 func respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(payload)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("Erro ao encode JSON: %v", err)
+	}
 }
 
 func respondWithError(w http.ResponseWriter, status int, message string) {
 	respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
+		"success":   false,
+		"error":     message,
+		"timestamp": time.Now().Format(time.RFC3339),
 	})
 }
 

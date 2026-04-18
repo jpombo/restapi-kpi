@@ -1,6 +1,8 @@
 package models
 
-import "time"
+import (
+	"time"
+)
 
 // Estruturas para o banco de dados
 type Indicador struct {

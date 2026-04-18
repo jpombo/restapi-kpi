@@ -1,10 +1,10 @@
 package service
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"time"
 
@@ -26,41 +26,93 @@ func NewKPIService(db *database.DB, ollamaClient *ollama.Client) *KPIService {
 }
 
 // CreateKPIWithMetasAndGenerateRequirements cria KPI, metas e gera requisitos via Ollama
+// Retorna erro APENAS se houver falha nos inserts (rollback completo)
 func (s *KPIService) CreateKPIWithMetasAndGenerateRequirements(req *models.CreateKPIRequest) (*models.CompleteKPIResponse, error) {
 	log.Printf("Iniciando criação do KPI: %s", req.Nome)
 
+	// Iniciar transação
+	tx, err := s.db.Conn.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("erro ao iniciar transação: %w", err)
+	}
+
+	// Garantir rollback em caso de erro
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+			log.Printf("Transação cancelada (rollback): %v", err)
+		}
+	}()
+
 	// 1. Validar se indicador existe
-	indicador, err := s.db.GetIndicadorByID(req.IndicadorID)
+	var indicadorID int
+	err = tx.QueryRow("SELECT id FROM indicador WHERE id = ?", req.IndicadorID).Scan(&indicadorID)
 	if err != nil {
-		return nil, fmt.Errorf("indicador não encontrado: %w", err)
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("indicador com ID %d não encontrado", req.IndicadorID)
+		}
+		return nil, fmt.Errorf("erro ao verificar indicador: %w", err)
 	}
 
-	// 2. Criar KPI no banco
-	kpi := &models.KPI{
-		IndicadorID:      req.IndicadorID,
-		Nome:             req.Nome,
-		Descricao:        req.Descricao,
-		TipoMeta:         req.TipoMeta,
-		Periodicidade:    req.Periodicidade,
-		FormulaCalculo:   req.FormulaCalculo,
-		UnidadeMedidaKPI: req.UnidadeMedidaKPI,
-		Ativo:            true,
-		DataCriacao:      time.Now(),
+	// 2. Inserir KPI
+	kpiQuery := `
+        INSERT INTO kpi 
+        (indicador_id, nome, descricao, tipo_meta, periodicidade, 
+         formula_calculo, unidade_medida_kpi, ativo, data_criacao)
+        VALUES (?, ?, ?, ?, ?, ?, ?, TRUE, NOW())
+    `
+
+	result, err := tx.Exec(
+		kpiQuery,
+		req.IndicadorID,
+		req.Nome,
+		req.Descricao,
+		req.TipoMeta,
+		req.Periodicidade,
+		req.FormulaCalculo,
+		req.UnidadeMedidaKPI,
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("erro ao inserir KPI: %w", err)
 	}
 
-	kpiID, err := s.db.CreateKPI(kpi)
+	kpiID, err := result.LastInsertId()
 	if err != nil {
-		return nil, fmt.Errorf("erro ao criar KPI: %w", err)
+		return nil, fmt.Errorf("erro ao obter ID do KPI: %w", err)
 	}
 
 	log.Printf("KPI criado com ID: %d", kpiID)
-	kpi.ID = kpiID
 
 	// 3. Inserir metas
 	var metasCriadas []models.Meta
 	for _, metaReq := range req.Metas {
-		meta := &models.Meta{
-			KPIID:               kpiID,
+		metaQuery := `
+            INSERT INTO meta 
+            (kpi_id, ano, periodo_referencia, valor_meta_numerica, valor_meta_percentual,
+             valor_meta_min, valor_meta_max, tipo_meta_realizado, observacao)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+
+		_, err := tx.Exec(
+			metaQuery,
+			kpiID,
+			metaReq.Ano,
+			metaReq.PeriodoReferencia,
+			metaReq.ValorMetaNumerica,
+			metaReq.ValorMetaPercentual,
+			metaReq.ValorMetaMin,
+			metaReq.ValorMetaMax,
+			metaReq.TipoMetaRealizado,
+			metaReq.Observacao,
+		)
+
+		if err != nil {
+			return nil, fmt.Errorf("erro ao inserir meta: %w", err)
+		}
+
+		metasCriadas = append(metasCriadas, models.Meta{
+			KPIID:               uint(kpiID),
 			Ano:                 metaReq.Ano,
 			PeriodoReferencia:   &metaReq.PeriodoReferencia,
 			ValorMetaNumerica:   metaReq.ValorMetaNumerica,
@@ -69,21 +121,28 @@ func (s *KPIService) CreateKPIWithMetasAndGenerateRequirements(req *models.Creat
 			ValorMetaMax:        metaReq.ValorMetaMax,
 			TipoMetaRealizado:   metaReq.TipoMetaRealizado,
 			Observacao:          metaReq.Observacao,
-		}
-
-		if err := s.db.CreateMeta(meta); err != nil {
-			log.Printf("Erro ao criar meta: %v", err)
-			continue
-		}
-
-		metasCriadas = append(metasCriadas, *meta)
+		})
 	}
 
 	log.Printf("%d metas inseridas", len(metasCriadas))
 
-	// 4. Preparar dados para enviar ao Ollama
+	// 4. COMMIT da transação (apenas após todas as inserções bem-sucedidas)
+	if err = tx.Commit(); err != nil {
+		return nil, fmt.Errorf("erro ao commitar transação: %w", err)
+	}
+
+	log.Printf("Transação commitada com sucesso para KPI %d", kpiID)
+
+	// 5. Buscar indicador completo (fora da transação)
+	indicador, err := s.db.GetIndicadorByID(req.IndicadorID)
+	if err != nil {
+		log.Printf("Aviso: não foi possível buscar indicador: %v", err)
+		indicador = &models.Indicador{ID: req.IndicadorID, Nome: "Indicador não encontrado"}
+	}
+
+	// 6. Preparar dados para enviar ao Ollama (opcional, não afeta o status dos inserts)
 	kpiWithIndicador := &models.KPI{
-		ID:               kpiID,
+		ID:               uint(kpiID),
 		Nome:             req.Nome,
 		Descricao:        req.Descricao,
 		TipoMeta:         req.TipoMeta,
@@ -93,58 +152,43 @@ func (s *KPIService) CreateKPIWithMetasAndGenerateRequirements(req *models.Creat
 		Indicador:        indicador,
 	}
 
-	// 5. Chamar Ollama para gerar requisitos
-	log.Println("Chamando Ollama para gerar requisitos...")
-	requirements, err := s.generateRequirementsFromKPI(kpiWithIndicador)
-	if err != nil {
-		log.Printf("Erro ao gerar requisitos via Ollama: %v", err)
-		// Não falha a criação do KPI, apenas retorna sem requisitos
-		return &models.CompleteKPIResponse{
-			KPI:     convertToKPIResponse(kpi),
-			Metas:   convertToMetaResponses(metasCriadas),
-			Success: true,
-			Message: "KPI criado, mas falha ao gerar requisitos: " + err.Error(),
-		}, nil
-	}
+	// 7. Tentar gerar requisitos via Ollama (não bloqueia o retorno de sucesso)
+	//var requirements *models.GeneratedRequirements
+	go func() {
+		// Chamada assíncrona para não bloquear a resposta
+		log.Println("Iniciando geração assíncrona de requisitos via Ollama...")
+		reqs, err := s.generateRequirementsFromKPI(kpiWithIndicador)
+		if err != nil {
+			log.Printf("Erro ao gerar requisitos via Ollama: %v", err)
+			return
+		}
 
-	// 6. Salvar requisitos gerados no banco
-	if err := s.saveGeneratedRequirements(kpiID, requirements); err != nil {
-		log.Printf("Erro ao salvar requisitos: %v", err)
-	}
+		// Salvar requisitos em uma nova transação
+		if err := s.saveGeneratedRequirements(uint(kpiID), reqs); err != nil {
+			log.Printf("Erro ao salvar requisitos gerados: %v", err)
+		} else {
+			log.Printf("Requisitos gerados e salvos com sucesso para KPI %d", kpiID)
+		}
+	}()
 
-	// 7. Montar resposta
+	// 8. Montar resposta de sucesso
 	response := &models.CompleteKPIResponse{
-		KPI:        convertToKPIResponse(kpi),
-		Requisitos: requirements,
-		Metas:      convertToMetaResponses(metasCriadas),
-		Success:    true,
-		Message:    "KPI, metas e requisitos criados com sucesso",
+		KPI: &models.KPIResponse{
+			ID:            uint(kpiID),
+			Nome:          req.Nome,
+			Descricao:     req.Descricao,
+			IndicadorID:   req.IndicadorID,
+			TipoMeta:      req.TipoMeta,
+			Periodicidade: req.Periodicidade,
+			CreatedAt:     time.Now(),
+		},
+		Metas:   convertToMetaResponses(metasCriadas),
+		Success: true,
+		Message: "KPI e metas criados com sucesso",
 	}
 
-	log.Printf("KPI %s processado com sucesso!", req.Nome)
+	log.Printf("KPI %s criado com sucesso!", req.Nome)
 	return response, nil
-}
-
-// GenerateRequirementsForExistingKPI gera requisitos para um KPI existente
-func (s *KPIService) GenerateRequirementsForExistingKPI(kpiID uint) (*models.GeneratedRequirements, error) {
-	// Buscar KPI e indicador
-	kpi, err := s.db.GetKPIWithIndicador(kpiID)
-	if err != nil {
-		return nil, fmt.Errorf("KPI não encontrado: %w", err)
-	}
-
-	// Gerar requisitos via Ollama
-	requirements, err := s.generateRequirementsFromKPI(kpi)
-	if err != nil {
-		return nil, err
-	}
-
-	// Salvar requisitos
-	if err := s.saveGeneratedRequirements(kpiID, requirements); err != nil {
-		return nil, fmt.Errorf("erro ao salvar requisitos: %w", err)
-	}
-
-	return requirements, nil
 }
 
 // generateRequirementsFromKPI prepara os dados e chama o Ollama
@@ -173,7 +217,7 @@ func (s *KPIService) generateRequirementsFromKPI(kpi *models.KPI) (*models.Gener
 
 	log.Printf("Enviando para Ollama: %s", string(kpiJSON))
 
-	// Chamar Ollama
+	// Chamar Ollama com timeout maior
 	response, err := s.ollamaClient.GenerateRequirements(string(kpiJSON))
 	if err != nil {
 		return nil, fmt.Errorf("erro ao chamar Ollama: %w", err)
@@ -207,52 +251,79 @@ func (s *KPIService) parseRequirementsResponse(response string) (*models.Generat
 	return &requirements, nil
 }
 
-// saveGeneratedRequirements salva os requisitos no banco
+// saveGeneratedRequirements salva os requisitos no banco (transação separada)
 func (s *KPIService) saveGeneratedRequirements(kpiID uint, requirements *models.GeneratedRequirements) error {
+	// Iniciar transação para salvar requisitos
+	tx, err := s.db.Conn.Begin()
+	if err != nil {
+		return fmt.Errorf("erro ao iniciar transação: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Salvar requisitos técnicos
 	for _, req := range requirements.RequisitosTecnicos {
-		requisito := &models.RequisitoKPI{
-			KPIID:                kpiID,
-			TipoRequisitoID:      1, // TECNICO
-			Codigo:               req.Codigo,
-			Titulo:               req.Titulo,
-			Descricao:            req.Descricao,
-			Prioridade:           req.Prioridade,
-			ComplexidadeEstimada: req.ComplexidadeEstimada,
-			Status:               "APROVADO",
-			CriadoPor:            "OLLAMA_GENERATOR",
-			DataCriacao:          time.Now(),
-		}
+		_, err := tx.Exec(`
+            INSERT INTO requisito_kpi 
+            (kpi_id, tipo_requisito_id, codigo, titulo, descricao, 
+             prioridade, complexidade_estimada, status, criado_por, data_criacao)
+            VALUES (?, 1, ?, ?, ?, ?, ?, 'APROVADO', 'OLLAMA_GENERATOR', NOW())
+        `, kpiID, req.Codigo, req.Titulo, req.Descricao, req.Prioridade, req.ComplexidadeEstimada)
 
-		if err := s.db.SaveRequisito(requisito); err != nil {
-			log.Printf("Erro ao salvar requisito %s: %v", req.Codigo, err)
+		if err != nil {
+			return fmt.Errorf("erro ao salvar requisito técnico %s: %w", req.Codigo, err)
 		}
 	}
 
 	// Salvar requisitos não funcionais
 	for _, req := range requirements.RequisitosNaoFuncionais {
-		categoriaID, _ := s.db.GetCategoriaNaoFuncionalID(req.Categoria)
-
-		requisito := &models.RequisitoKPI{
-			KPIID:                   kpiID,
-			TipoRequisitoID:         2, // NAO_FUNCIONAL
-			Codigo:                  req.Codigo,
-			Titulo:                  req.Titulo,
-			Descricao:               req.Descricao,
-			CategoriaNaoFuncionalID: categoriaID,
-			Prioridade:              req.Prioridade,
-			ComplexidadeEstimada:    req.ComplexidadeEstimada,
-			Status:                  "APROVADO",
-			CriadoPor:               "OLLAMA_GENERATOR",
-			DataCriacao:             time.Now(),
+		// Buscar ID da categoria
+		var categoriaID *uint
+		err := tx.QueryRow("SELECT id FROM categoria_nao_funcional WHERE nome = ?", req.Categoria).Scan(&categoriaID)
+		if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("erro ao buscar categoria: %w", err)
 		}
 
-		if err := s.db.SaveRequisito(requisito); err != nil {
-			log.Printf("Erro ao salvar requisito %s: %v", req.Codigo, err)
+		_, err = tx.Exec(`
+            INSERT INTO requisito_kpi 
+            (kpi_id, tipo_requisito_id, codigo, titulo, descricao, 
+             categoria_nao_funcional_id, prioridade, complexidade_estimada, 
+             status, criado_por, data_criacao)
+            VALUES (?, 2, ?, ?, ?, ?, ?, ?, 'APROVADO', 'OLLAMA_GENERATOR', NOW())
+        `, kpiID, req.Codigo, req.Titulo, req.Descricao, categoriaID, req.Prioridade, req.ComplexidadeEstimada)
+
+		if err != nil {
+			return fmt.Errorf("erro ao salvar requisito não funcional %s: %w", req.Codigo, err)
 		}
 	}
 
+	// Commit da transação de requisitos
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("erro ao commitar requisitos: %w", err)
+	}
+
 	return nil
+}
+
+// GenerateRequirementsForExistingKPI gera requisitos para um KPI existente
+func (s *KPIService) GenerateRequirementsForExistingKPI(kpiID uint) (*models.GeneratedRequirements, error) {
+	// Buscar KPI e indicador
+	kpi, err := s.db.GetKPIWithIndicador(kpiID)
+	if err != nil {
+		return nil, fmt.Errorf("KPI não encontrado: %w", err)
+	}
+
+	// Gerar requisitos via Ollama
+	requirements, err := s.generateRequirementsFromKPI(kpi)
+	if err != nil {
+		return nil, err
+	}
+
+	// Salvar requisitos
+	if err := s.saveGeneratedRequirements(kpiID, requirements); err != nil {
+		return nil, fmt.Errorf("erro ao salvar requisitos: %w", err)
+	}
+
+	return requirements, nil
 }
 
 // GetKPIWithMetas busca KPI e suas metas
@@ -291,19 +362,7 @@ func (s *KPIService) GetAllKPIs() ([]models.KPIResponse, error) {
 	return kpis, nil
 }
 
-// Função auxiliar
-func convertToKPIResponse(kpi *models.KPI) *models.KPIResponse {
-	return &models.KPIResponse{
-		ID:            kpi.ID,
-		Nome:          kpi.Nome,
-		Descricao:     kpi.Descricao,
-		IndicadorID:   kpi.IndicadorID,
-		TipoMeta:      kpi.TipoMeta,
-		Periodicidade: kpi.Periodicidade,
-		CreatedAt:     kpi.DataCriacao,
-	}
-}
-
+// Funções auxiliares
 func convertToMetaResponses(metas []models.Meta) []models.MetaResponse {
 	var responses []models.MetaResponse
 	for _, m := range metas {
@@ -320,218 +379,4 @@ func convertToMetaResponses(metas []models.Meta) []models.MetaResponse {
 		})
 	}
 	return responses
-}
-
-// ProcessKPI processa um KPI, gera requisitos via Ollama e salva no banco
-func (s *KPIService) ProcessKPI(kpiID uint) error {
-	log.Printf("Processando KPI ID: %d", kpiID)
-
-	// 1. Buscar KPI do banco
-	kpi, err := s.db.GetKPIWithIndicador(kpiID)
-	if err != nil {
-		return fmt.Errorf("erro ao buscar KPI: %w", err)
-	}
-
-	// 2. Preparar dados para enviar ao Ollama
-	kpiRequest := s.prepareKPIRequest(kpi)
-	kpiJSON, err := json.Marshal(kpiRequest)
-	if err != nil {
-		return fmt.Errorf("erro ao serializar KPI: %w", err)
-	}
-
-	log.Printf("Enviando para Ollama: %s", string(kpiJSON))
-
-	// 3. Chamar Ollama
-	response, err := s.ollamaClient.GenerateRequirements(string(kpiJSON))
-	if err != nil {
-		return fmt.Errorf("erro ao chamar Ollama: %w", err)
-	}
-
-	log.Printf("Resposta recebida do Ollama (tamanho: %d bytes)", len(response))
-
-	// 4. Parse da resposta JSON
-	requirements, err := s.parseRequirementsResponse(response)
-	if err != nil {
-		return fmt.Errorf("erro ao parsear resposta: %w", err)
-	}
-
-	// 5. Salvar requisitos técnicos
-	for _, req := range requirements.RequisitosTecnicos {
-		if err := s.saveRequisitoTecnico(kpiID, req); err != nil {
-			log.Printf("Erro ao salvar requisito %s: %v", req.Codigo, err)
-			continue
-		}
-		log.Printf("Requisito técnico %s salvo com sucesso", req.Codigo)
-	}
-
-	// 6. Salvar requisitos não funcionais
-	for _, req := range requirements.RequisitosNaoFuncionais {
-		if err := s.saveRequisitoNaoFuncional(kpiID, req); err != nil {
-			log.Printf("Erro ao salvar requisito %s: %v", req.Codigo, err)
-			continue
-		}
-		log.Printf("Requisito não funcional %s salvo com sucesso", req.Codigo)
-	}
-
-	// 7. Salvar metas sugeridas
-	for _, meta := range requirements.MetasSugeridas {
-		if err := s.saveMeta(kpiID, meta); err != nil {
-			log.Printf("Erro ao salvar meta: %v", err)
-			continue
-		}
-		log.Printf("Meta salva com sucesso para período %s", meta.PeriodoReferencia)
-	}
-
-	log.Printf("KPI %d processado com sucesso!", kpiID)
-	return nil
-}
-
-func (s *KPIService) prepareKPIRequest(kpi *models.KPI) *models.KPIRequest {
-	req := &models.KPIRequest{
-		ID:               kpi.ID,
-		Nome:             kpi.Nome,
-		Descricao:        kpi.Descricao,
-		TipoMeta:         kpi.TipoMeta,
-		Periodicidade:    kpi.Periodicidade,
-		FormulaCalculo:   kpi.FormulaCalculo,
-		UnidadeMedidaKPI: kpi.UnidadeMedidaKPI,
-	}
-
-	if kpi.Indicador != nil {
-		req.Indicador.ID = kpi.Indicador.ID
-		req.Indicador.Nome = kpi.Indicador.Nome
-		req.Indicador.UnidadeMedida = kpi.Indicador.UnidadeMedida
-	}
-
-	return req
-}
-
-func (s *KPIService) saveRequisitoTecnico(kpiID uint, req struct {
-	Codigo               string `json:"codigo"`
-	Titulo               string `json:"titulo"`
-	Descricao            string `json:"descricao"`
-	Prioridade           string `json:"prioridade"`
-	ComplexidadeEstimada string `json:"complexidade_estimada"`
-}) error {
-	requisito := &models.RequisitoKPI{
-		KPIID:                kpiID,
-		TipoRequisitoID:      1, // TECNICO
-		Codigo:               req.Codigo,
-		Titulo:               req.Titulo,
-		Descricao:            req.Descricao,
-		Prioridade:           req.Prioridade,
-		ComplexidadeEstimada: req.ComplexidadeEstimada,
-		Status:               "APROVADO",
-		CriadoPor:            "OLLAMA_GENERATOR",
-	}
-
-	return s.db.SaveRequisito(requisito)
-}
-
-func (s *KPIService) saveRequisitoNaoFuncional(kpiID uint, req struct {
-	Codigo               string `json:"codigo"`
-	Titulo               string `json:"titulo"`
-	Descricao            string `json:"descricao"`
-	Categoria            string `json:"categoria"`
-	Prioridade           string `json:"prioridade"`
-	ComplexidadeEstimada string `json:"complexidade_estimada"`
-}) error {
-	// Busca ID da categoria
-	categoriaID, err := s.db.GetCategoriaNaoFuncionalID(req.Categoria)
-	if err != nil {
-		return err
-	}
-
-	requisito := &models.RequisitoKPI{
-		KPIID:                   kpiID,
-		TipoRequisitoID:         2, // NAO_FUNCIONAL
-		Codigo:                  req.Codigo,
-		Titulo:                  req.Titulo,
-		Descricao:               req.Descricao,
-		CategoriaNaoFuncionalID: categoriaID,
-		Prioridade:              req.Prioridade,
-		ComplexidadeEstimada:    req.ComplexidadeEstimada,
-		Status:                  "APROVADO",
-		CriadoPor:               "OLLAMA_GENERATOR",
-	}
-
-	return s.db.SaveRequisito(requisito)
-}
-
-func (s *KPIService) saveMeta(kpiID uint, meta struct {
-	PeriodoReferencia string `json:"periodo_referencia"`
-	TipoMeta          string `json:"tipo_meta"`
-	Valor             string `json:"valor"`
-	Observacao        string `json:"observacao"`
-}) error {
-	metaModel := &models.Meta{
-		KPIID:             kpiID,
-		Ano:               uint(time.Now().Year()),
-		PeriodoReferencia: &meta.PeriodoReferencia,
-		TipoMetaRealizado: meta.TipoMeta,
-		Observacao:        &meta.Observacao,
-	}
-
-	// Parse do valor baseado no tipo
-	switch meta.TipoMeta {
-	case "NUMERICA":
-		val, err := strconv.ParseFloat(strings.Replace(meta.Valor, "R$", "", -1), 64)
-		if err != nil {
-			return err
-		}
-		metaModel.ValorMetaNumerica = &val
-
-	case "PERCENTUAL":
-		val, err := strconv.ParseFloat(strings.Replace(meta.Valor, "%", "", -1), 64)
-		if err != nil {
-			return err
-		}
-		metaModel.ValorMetaPercentual = &val
-
-	case "INTERVALO_NUM":
-		partes := strings.Split(meta.Valor, " a ")
-		if len(partes) == 2 {
-			min, err := strconv.ParseFloat(partes[0], 64)
-			if err != nil {
-				return err
-			}
-			max, err := strconv.ParseFloat(partes[1], 64)
-			if err != nil {
-				return err
-			}
-			metaModel.ValorMetaMin = &min
-			metaModel.ValorMetaMax = &max
-		}
-	}
-
-	return s.db.SaveMeta(metaModel)
-}
-
-// service/kpi_service.go - Adicionar retry
-func (s *KPIService) ProcessKPIWithRetry(kpiID uint, maxRetries int) error {
-	var lastErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		log.Printf("Tentativa %d de %d para KPI %d", attempt, maxRetries, kpiID)
-
-		err := s.ProcessKPI(kpiID)
-		if err == nil {
-			return nil
-		}
-
-		lastErr = err
-
-		// Verificar se é erro de timeout
-		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
-			waitTime := time.Duration(attempt*30) * time.Second
-			log.Printf("Timeout detectado, aguardando %v antes de tentar novamente...", waitTime)
-			time.Sleep(waitTime)
-			continue
-		}
-
-		// Outros erros não devem ser retentados
-		return err
-	}
-
-	return fmt.Errorf("falha após %d tentativas: %w", maxRetries, lastErr)
 }
