@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -25,17 +26,20 @@ func LoadConfig() *Config {
 		log.Println("Arquivo .env não encontrado, usando variáveis de ambiente")
 	}
 
-	dbPort, _ := strconv.Atoi(getEnv("DB_PORT", "3306"))
-	ollamaTimeout, _ := strconv.Atoi(getEnv("OLLAMA_TIMEOUT", "300"))
+	log.Println(os.Getenv("DB_LOCAL"))
+
+	// Garantir que a variável de ambiente seja lida
+	dbPort, _ := strconv.Atoi(getEnv("DB_PORT", "300"))
+	ollamaTimeout, _ := strconv.Atoi(getEnv("OLLAMA_TIMEOUT", "600"))
 
 	return &Config{
-		DBHost:        getEnv("DB_HOST", "localhost"),
+		DBHost:        getEnv("DB_HOST", ""),
 		DBPort:        dbPort,
-		DBUser:        getEnv("DB_USER", "root"),
-		DBPassword:    getEnv("DB_PASSWORD", ""),
-		DBName:        getEnv("DB_NAME", "kpi_db"),
-		OllamaURL:     getEnv("OLLAMA_URL", "http://localhost:11434"),
-		OllamaModel:   getEnv("OLLAMA_MODEL", "kpi-requirement-generator"),
+		DBUser:        getEnv("DB_USER", ""),
+		DBPassword:    strings.ReplaceAll(os.Getenv("DB_LOCAL"), "_", "&"),
+		DBName:        getEnv("DB_NAME", ""),
+		OllamaURL:     getEnv("OLLAMA_URL", ""),
+		OllamaModel:   getEnv("OLLAMA_MODEL", ""),
 		OllamaTimeout: ollamaTimeout,
 	}
 }

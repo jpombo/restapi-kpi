@@ -1,32 +1,19 @@
 package main
 
 import (
-	"context"
-	"flag"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
+	"net/http"
 	"time"
 
 	"kpi-requirement-generator/config"
 	"kpi-requirement-generator/database"
+	"kpi-requirement-generator/handlers"
 	"kpi-requirement-generator/ollama"
+	"kpi-requirement-generator/routes"
 	"kpi-requirement-generator/service"
 )
 
 func main() {
-	var kpiID uint
-	var allKPIs bool
-
-	flag.UintVar(&kpiID, "kpi-id", 0, "ID do KPI a ser processado")
-	flag.BoolVar(&allKPIs, "all", false, "Processar todos os KPIs ativos")
-	flag.Parse()
-
-	if kpiID == 0 && !allKPIs {
-		log.Fatal("É necessário informar -kpi-id ou -all")
-	}
-
 	// Carregar configuração
 	cfg := config.LoadConfig()
 
@@ -37,50 +24,36 @@ func main() {
 	}
 	defer db.Close()
 
-	// Criar cliente Ollama com timeout configurável
+	// Criar cliente Ollama com timeout
 	ollamaClient := ollama.NewClientWithTimeout(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaTimeout)
 
 	// Criar service
 	kpiService := service.NewKPIService(db, ollamaClient)
 
-	// Contexto com timeout global (ex: 10 minutos)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
+	// Criar handler
+	kpiHandler := handlers.NewKPIHandler(kpiService)
 
-	// Configurar graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// Configurar rotas
+	router := routes.SetupRoutes(kpiHandler)
 
-	go func() {
-		<-sigChan
-		log.Println("Recebido sinal de interrupção, finalizando...")
-		cancel()
-		os.Exit(0)
-	}()
+	// Configurar servidor
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      router,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 300 * time.Second, // Timeout longo para Ollama
+		IdleTimeout:  60 * time.Second,
+	}
 
-	// Processar KPI com contexto
-	if allKPIs {
-		log.Println("Processando todos os KPIs ativos...")
-		// Implementar processamento em lote
-	} else {
-		log.Printf("Processando KPI ID: %d (timeout: %d segundos)", kpiID, cfg.OllamaTimeout)
+	log.Println("Servidor iniciado na porta 8080")
+	log.Println("Endpoints disponíveis:")
+	log.Println("  POST   /api/v1/kpis                    - Criar KPI com metas e gerar requisitos")
+	log.Println("  GET    /api/v1/kpis                    - Listar todos os KPIs")
+	log.Println("  GET    /api/v1/kpis/{id}               - Buscar KPI por ID")
+	log.Println("  POST   /api/v1/kpis/{id}/generate-requirements - Gerar requisitos para KPI existente")
+	log.Println("  GET    /api/v1/health                  - Health check")
 
-		// Criar channel para receber resultado
-		done := make(chan error, 1)
-
-		go func() {
-			done <- kpiService.ProcessKPI(kpiID)
-		}()
-
-		// Aguardar resultado ou timeout
-		select {
-		case err := <-done:
-			if err != nil {
-				log.Fatalf("Erro ao processar KPI: %v", err)
-			}
-			log.Println("Processamento concluído com sucesso!")
-		case <-ctx.Done():
-			log.Fatal("Timeout global excedido ao processar KPI")
-		}
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("Erro ao iniciar servidor: %v", err)
 	}
 }

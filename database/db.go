@@ -42,6 +42,134 @@ func (db *DB) Close() error {
 	return db.Conn.Close()
 }
 
+// CreateKPI insere um novo KPI e retorna o ID gerado
+func (db *DB) CreateKPI(kpi *models.KPI) (uint, error) {
+	query := `
+        INSERT INTO kpi 
+        (indicador_id, nome, descricao, tipo_meta, periodicidade, 
+         formula_calculo, unidade_medida_kpi, ativo, data_criacao)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+    `
+
+	result, err := db.Conn.Exec(
+		query,
+		kpi.IndicadorID,
+		kpi.Nome,
+		kpi.Descricao,
+		kpi.TipoMeta,
+		kpi.Periodicidade,
+		kpi.FormulaCalculo,
+		kpi.UnidadeMedidaKPI,
+		true,
+	)
+
+	if err != nil {
+		return 0, err
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+
+	return uint(id), nil
+}
+
+// CreateMeta insere uma nova meta
+func (db *DB) CreateMeta(meta *models.Meta) error {
+	query := `
+        INSERT INTO meta 
+        (kpi_id, ano, periodo_referencia, valor_meta_numerica, valor_meta_percentual,
+         valor_meta_min, valor_meta_max, tipo_meta_realizado, observacao)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `
+
+	_, err := db.Conn.Exec(
+		query,
+		meta.KPIID,
+		meta.Ano,
+		meta.PeriodoReferencia,
+		meta.ValorMetaNumerica,
+		meta.ValorMetaPercentual,
+		meta.ValorMetaMin,
+		meta.ValorMetaMax,
+		meta.TipoMetaRealizado,
+		meta.Observacao,
+	)
+
+	return err
+}
+
+// GetKPIByID busca um KPI completo com suas metas
+func (db *DB) GetKPIByID(kpiID uint) (*models.KPI, []models.Meta, error) {
+	// Buscar KPI
+	kpiQuery := `
+        SELECT id, indicador_id, nome, descricao, tipo_meta, periodicidade,
+               formula_calculo, unidade_medida_kpi, ativo, data_criacao
+        FROM kpi
+        WHERE id = ? AND ativo = TRUE
+    `
+
+	var kpi models.KPI
+	err := db.Conn.QueryRow(kpiQuery, kpiID).Scan(
+		&kpi.ID, &kpi.IndicadorID, &kpi.Nome, &kpi.Descricao, &kpi.TipoMeta,
+		&kpi.Periodicidade, &kpi.FormulaCalculo, &kpi.UnidadeMedidaKPI,
+		&kpi.Ativo, &kpi.DataCriacao,
+	)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Buscar metas
+	metasQuery := `
+        SELECT id, kpi_id, ano, periodo_referencia, valor_meta_numerica,
+               valor_meta_percentual, valor_meta_min, valor_meta_max,
+               tipo_meta_realizado, observacao
+        FROM meta
+        WHERE kpi_id = ?
+    `
+
+	rows, err := db.Conn.Query(metasQuery, kpiID)
+	if err != nil {
+		return &kpi, nil, err
+	}
+	defer rows.Close()
+
+	var metas []models.Meta
+	for rows.Next() {
+		var meta models.Meta
+		err := rows.Scan(
+			&meta.ID, &meta.KPIID, &meta.Ano, &meta.PeriodoReferencia,
+			&meta.ValorMetaNumerica, &meta.ValorMetaPercentual,
+			&meta.ValorMetaMin, &meta.ValorMetaMax,
+			&meta.TipoMetaRealizado, &meta.Observacao,
+		)
+		if err != nil {
+			return &kpi, metas, err
+		}
+		metas = append(metas, meta)
+	}
+
+	return &kpi, metas, nil
+}
+
+// GetIndicadorByID busca um indicador pelo ID
+func (db *DB) GetIndicadorByID(indicadorID uint) (*models.Indicador, error) {
+	query := `SELECT id, nome, descricao, unidade_medida FROM indicador WHERE id = ?`
+
+	var indicador models.Indicador
+	err := db.Conn.QueryRow(query, indicadorID).Scan(
+		&indicador.ID, &indicador.Nome, &indicador.Descricao, &indicador.UnidadeMedida,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &indicador, nil
+}
+
 // GetKPIWithIndicador busca um KPI pelo ID com seus dados do indicador
 func (db *DB) GetKPIWithIndicador(kpiID uint) (*models.KPI, error) {
 	query := `
